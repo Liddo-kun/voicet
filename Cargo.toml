@@ -1,0 +1,23 @@
+[package]
+name = "voicet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = { path = "candle-fork/candle-core", features = ["cuda"] }
+candle-nn = { path = "candle-fork/candle-nn", features = ["cuda"] }
+candle-flash-attn = { path = "candle-fork/candle-flash-attn" }
+safetensors = "0.7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+memmap2 = "0.9"
+serde_json = "1"
+base64 = "0.22"
+hound = "3"
+num_cpus = "1"
+cpal = "0.15"
+ctrlc = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
