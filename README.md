@@ -17,6 +17,9 @@ The official HuggingFace pipeline works, but it carries a lot of weight:
 | Dependencies | Just CUDA runtime | Python ecosystem, pip, conda, venv |
 | Deployment | Copy one binary + model weights | Reproduce Python environment |
 
+Other features:
+Resumable requests. Processes audio pipeline in parallel with gpu compute, eliminating gpu compute latency
+
 Performance comes from:
 - **Flash Attention v2** — fused CUDA kernels for both encoder (32 layers) and decoder (26 layers)
 - **Fused RMSNorm** — single CUDA kernel replaces 7 ops, saves ~530 kernel launches per token
