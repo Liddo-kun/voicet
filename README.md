@@ -11,8 +11,8 @@ The official HuggingFace pipeline works, but it carries a lot of weight:
 |  | **Voicet (Rust)** | **HF Transformers (Python)** |
 |---|---|---|
 | Runtime | Single 35 MB binary | Python + PyTorch + Transformers (~5 GB installed) |
-| Startup | ~3s (mmap weights directly) | ~15s (Python imports + model load) |
-| Throughput | ~73 tok/s (0.16x real-time) | ~45 tok/s (0.25x real-time) |
+| Startup | 3.0s (mmap weights directly) | 6.8s (Python imports + weight loading) |
+| Throughput | 73.7 tok/s (0.15x real-time) | 24.5 tok/s (0.44x real-time) |
 | Streaming | Native — causal architecture, incremental mel/encoder/decoder | Requires custom pipeline code |
 | Dependencies | Just CUDA runtime | Python ecosystem, pip, conda, venv |
 | Deployment | Copy one binary + model weights | Reproduce Python environment |
