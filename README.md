@@ -12,7 +12,7 @@ The official HuggingFace pipeline works, but it carries a lot of weight:
 |---|---|---|
 | Runtime | Single 35 MB binary | Python + PyTorch + Transformers (~5 GB installed) |
 | Startup | 3.0s (mmap weights directly) | 6.8s (Python imports + weight loading) |
-| Throughput | 73.7 tok/s (0.15x real-time) | 24.5 tok/s (0.44x real-time) |
+| Throughput | 63 tok/s (0.20x real-time) | 24.5 tok/s (0.44x real-time) |
 | Streaming | Native — causal architecture, incremental mel/encoder/decoder | Requires custom pipeline code |
 | Dependencies | Just CUDA runtime | Python ecosystem, pip, conda, venv |
 | Deployment | Copy one binary + model weights | Reproduce Python environment |
@@ -31,7 +31,7 @@ Performance comes from:
 
 ### Prerequisites
 
-- NVIDIA GPU with CUDA support (tested on RTX series)
+- NVIDIA GPU with CUDA support (tested on RTX 5080)
 - [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) installed
 - Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into a `Voxtral-Mini-4B-Realtime/` directory
 
@@ -75,15 +75,17 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full details.
 
 ## Configuration
 
-Tunable parameters are constants in the source code:
-
-| Parameter | Default | Location | Effect |
-|---|---|---|---|
-| Delay tokens | 4 (320ms) | `decoder.rs` | Accuracy vs latency. Higher = more lookahead = better accuracy. |
-| Encoder window | 750 (15s) | `encoder.rs` | How far back the encoder attends. |
-| Decoder window | 2048 (~2.7min) | `decoder.rs` | Max decoder context before KV cache trim. |
-| Silence threshold | 0.01 | `streaming.rs` | RMS energy below which audio is silence. |
-| Silence newline | 10 chunks (800ms) | `streaming.rs` | Consecutive silent chunks before paragraph break. |
+| CLI flag | Default | Effect |
+|---|---|---|
+| `--delay` | 3 (240ms) | Accuracy vs latency. Higher = more lookahead. Auto-set to 20 in offline mode. |
+| `--silence-threshold` | 0.007 | RMS energy below which audio counts as silence. |
+| `--silence-flush` | delay+9 | Consecutive silent chunks before paragraph break. |
+| `--min-speech` | 8 (640ms) | Minimum speech duration before silence detection activates. |
+| `--rms-ema` | 0.3 | EMA smoothing factor for speech detection. |
+| `--hotkey` | none | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause). |
+| `--type` | off | Type transcribed words directly into the focused app. |
+| `--model-dir` | `.` | Directory containing model files. |
+| `--device` | 0 | CUDA device index. |
 
 ## Dependencies
 
