@@ -87,10 +87,14 @@ fn main() -> Result<()> {
     let device = Device::cuda_if_available(cli.device)?;
     let dtype = DType::BF16;
 
+    let is_offline = cli.wav_file.is_some();
+    let effective_delay = if is_offline { 20 } else { cli.delay };
+
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
-    println!("{:<28} {} ({}ms)",
-        "Delay tokens", cli.delay, cli.delay * 80);
+    println!("{:<28} {} ({}ms){}",
+        "Delay tokens", effective_delay, effective_delay * 80,
+        if is_offline { " (offline max accuracy)" } else { "" });
     println!("{:<28} {} ({}s)",
         "Encoder sliding window", encoder::SLIDING_WINDOW, encoder::SLIDING_WINDOW * 20 / 1000);
     println!("{:<28} {} ({:.0}min)",
@@ -145,7 +149,9 @@ fn main() -> Result<()> {
     };
 
     match cli.wav_file {
-        Some(path) => run_offline(&path, cli.delay, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype),
+        Some(path) => {
+            run_offline(&path, effective_delay, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype)
+        }
         None => {
             println!("\n=== Voicet Streaming Mode ===\n");
             streaming::run_streaming(&mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype, &config)
@@ -236,6 +242,7 @@ fn run_offline(
         let next_token = argmax_last(&logits)?;
         generated_tokens.push(next_token);
         pos += 1;
+        dec.trim_caches();
     }
 
     let gen_time = t0.elapsed().as_secs_f64();

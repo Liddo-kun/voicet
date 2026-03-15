@@ -280,7 +280,7 @@ impl AudioEncoder {
     }
 
     /// Run the full encoder: mel -> conv stem -> chunked transformer -> final norm.
-    /// Resets KV caches, then processes all frames in CHUNK_SIZE chunks.
+    /// Resets KV caches, then processes all frames in large chunks for GPU efficiency.
     pub fn forward(&mut self, mel: &Tensor) -> candle_core::Result<Tensor> {
         let x = self.conv_stem(mel)?;
         let total_frames = x.dim(1)?;
@@ -289,15 +289,19 @@ impl AudioEncoder {
             layer.reset_cache();
         }
 
-        let n_full_chunks = total_frames / CHUNK_SIZE;
-        let remainder = total_frames % CHUNK_SIZE;
+        // Use large chunks for offline mode — bigger matmuls saturate the GPU better.
+        // Streaming uses CHUNK_SIZE (4) via forward_chunk() separately.
+        let offline_chunk = SLIDING_WINDOW / 2;
+        let n_full_chunks = total_frames / offline_chunk;
+        let remainder = total_frames % offline_chunk;
         let n_chunks = n_full_chunks + if remainder > 0 { 1 } else { 0 };
         let mut chunk_outputs = Vec::with_capacity(n_chunks);
 
         for chunk_idx in 0..n_chunks {
-            let chunk_len = if chunk_idx < n_full_chunks { CHUNK_SIZE } else { remainder };
-            let chunk = x.narrow(1, chunk_idx * CHUNK_SIZE, chunk_len)?;
+            let chunk_len = if chunk_idx < n_full_chunks { offline_chunk } else { remainder };
+            let chunk = x.narrow(1, chunk_idx * offline_chunk, chunk_len)?;
             chunk_outputs.push(self.forward_chunk(&chunk)?);
+            self.trim_caches();
         }
 
         let chunk_refs: Vec<&Tensor> = chunk_outputs.iter().collect();

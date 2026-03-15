@@ -124,14 +124,16 @@ impl KvCache {
     }
 
     /// Trim cache to at most `max_len` entries, dropping the oldest.
+    /// Trims to 75% of max_len to avoid copying every token.
     /// Layout: [batch, seq, heads, head_dim].
     pub fn trim(&mut self, max_len: usize) {
         if let (Some(k), Some(v)) = (&self.k, &self.v) {
             let len = k.dim(1).unwrap_or(0);
             if len > max_len {
-                let drop = len - max_len;
-                self.k = Some(k.narrow(1, drop, max_len).unwrap().contiguous().unwrap());
-                self.v = Some(v.narrow(1, drop, max_len).unwrap().contiguous().unwrap());
+                let keep = max_len * 3 / 4;
+                let drop = len - keep;
+                self.k = Some(k.narrow(1, drop, keep).unwrap().contiguous().unwrap());
+                self.v = Some(v.narrow(1, drop, keep).unwrap().contiguous().unwrap());
                 self.base_offset += drop;
             }
         }
