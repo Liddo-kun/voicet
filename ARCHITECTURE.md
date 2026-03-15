@@ -67,16 +67,24 @@ The conv stem runs on a fixed 12-frame window each tick (O(1) per token, not O(n
 
 ## Configurable Parameters
 
-Printed at startup. All values reference constants in the source code.
+Printed at startup. CLI flags override defaults; architectural constants are fixed.
 
-| Parameter | Constant | Location | Default | Effect |
-| --- | --- | --- | --- | --- |
-| Delay tokens | `NUM_DELAY_TOKENS` | `decoder.rs` | 4 (320ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. |
-| Encoder sliding window | `SLIDING_WINDOW` | `encoder.rs` | 750 (15s) | How far back the encoder can attend. Fixed by model architecture. |
-| Decoder sliding window | `SLIDING_WINDOW` | `decoder.rs` | 2048 (~2.7min) | Max decoder context before KV cache is trimmed. Increase for very long sessions if GPU memory allows. |
-| Silence threshold | `SILENCE_THRESHOLD` | `streaming.rs` | 0.01 | RMS energy below which audio is considered silence. |
-| Silence newline after | `SILENCE_CHUNKS` | `streaming.rs` | 10 (800ms) | Consecutive silent chunks before emitting a newline. |
-| Compute dtype | — | `main.rs` | BF16 | Model precision. BF16 matches PyTorch default. |
+| CLI flag | Default | Effect |
+| --- | --- | --- |
+| `--delay` | 3 (240ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. Valid: 1-30. |
+| `--silence-threshold` | 0.007 | Raw RMS energy below which a chunk counts as silent. |
+| `--silence-flush` | delay+9 | Consecutive silent chunks before emitting a paragraph break. |
+| `--min-speech` | 8 (640ms) | Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
+| `--rms-ema` | 0.3 | EMA smoothing factor for speech detection. Lower = smoother, rides over inter-syllable dips. |
+| `--hotkey` | none | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen). Enables hotkey mode with prebuffer. |
+| `--type` | off | Inject text as keystrokes into focused app via enigo instead of printing to stdout. |
+| `--device` | 0 | CUDA device index. |
+
+| Architectural constant | Location | Value | Notes |
+| --- | --- | --- | --- |
+| Encoder sliding window | `encoder.rs` | 750 (15s) | Fixed by model architecture. |
+| Decoder sliding window | `decoder.rs` | 2048 (~2.7min) | Max decoder KV cache before trimming. |
+| Compute dtype | `main.rs` | BF16 | Matches PyTorch default. |
 
 ---
 
@@ -85,6 +93,8 @@ Printed at startup. All values reference constants in the source code.
 Voicet uses the [candle](https://github.com/huggingface/candle) ML framework for Rust. Three crates are used: `candle-core`, `candle-nn`, and `candle-flash-attn`. All are vendored locally in `candle-fork/` (referenced via `path` in `Cargo.toml`) so builds work offline.
 
 The `candle-flash-attn` crate is a fork ([Liddo-kun/candle](https://github.com/Liddo-kun/candle), branch `voicet-minimal-kernels`) that compiles only the CUDA kernels this model needs: BF16, head_dim 64 (encoder) and 128 (decoder). The upstream crate compiles all 32 variants (8 head dims × 2 dtypes × 2 causal modes), which inflated the binary from ~10 MB to ~190 MB. The fork reduces it to ~35 MB.
+
+Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook), `enigo` (keystroke injection for `--type` mode), `cpal` (mic capture), `hound` (WAV reading), `clap` (CLI parsing).
 
 ---
 
@@ -105,3 +115,49 @@ The `candle-flash-attn` crate is a fork ([Liddo-kun/candle](https://github.com/L
 - Runs in the browser via WASM + WebGPU
 - **703MB peak RAM** with Q4 vs our multi-GB footprint
 - Real-time factor of 0.416 (transcribes faster than real-time)
+
+---
+
+## Key Weight Name Mapping
+
+The safetensors file uses **Mistral native naming** (not HuggingFace). 711 tensors total. We load from `consolidated.safetensors`.
+
+```
+Safetensors name                                                          → Rust struct field
+────────────────────────────────────────────────────────────────────────────────────────────────
+ENCODER (421 tensors)
+mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.{weight,bias}  → encoder.conv_stem[0]
+mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.{weight,bias}  → encoder.conv_stem[1]
+mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.attention.{wq,wk,wv,wo}.{weight,bias}  → encoder.layers[i].attn
+mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.feed_forward.{w1,w2,w3}.{weight,bias}  → encoder.layers[i].mlp
+mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.{attention_norm,ffn_norm}.weight  → encoder.layers[i].norms
+mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight  → encoder.final_norm
+
+ADAPTER (2 tensors)
+mm_streams_embeddings.embedding_module.audio_language_projection.0.weight  → adapter.linear_in   [3072, 5120]
+mm_streams_embeddings.embedding_module.audio_language_projection.2.weight  → adapter.linear_out  [3072, 3072]
+
+SHARED TOK_EMBEDDINGS (1 tensor — serves as embed + lm_head, tied weights)
+mm_streams_embeddings.embedding_module.tok_embeddings.weight  → shared.tok_embeddings  [131072, 3072]
+
+DECODER (287 tensors)
+layers.{i}.attention.{wq,wk,wv,wo}.weight         → decoder.layers[i].attn (GQA: 32Q/8KV heads)
+layers.{i}.{attention_norm,ffn_norm}.weight         → decoder.layers[i].norms
+layers.{i}.feed_forward.{w1,w2,w3}.weight           → decoder.layers[i].mlp
+layers.{i}.ada_rms_norm_t_cond.{0,2}.weight         → decoder.layers[i].ada_norm (bottleneck dim=32)
+norm.weight                                         → decoder.final_norm
+```
+
+**Implementation notes:**
+
+- Q/K weights must be deinterleaved at load time via `deinterleave_qk()` — both encoder (32 heads, head_dim=64) and decoder (32Q/8KV heads, head_dim=128). V and O weights need no conversion.
+- Encoder has biases on wq, wv, wo, w2. Decoder has NO biases on any linear layer.
+- `candle-nn` must have `features = ["cuda"]` to unlock fused CUDA kernels (`rms_norm`, `softmax_last_dim`). Without it, these silently fall back to multi-op defaults.
+- KV cache uses flash attention layout `[batch, seq, heads, hdim]`. RoPE applies on this layout directly (no transpose needed).
+- candle `Tensor::sub` does not broadcast — use `.broadcast_sub()` etc.
+
+**Special tokens (from tekken.json, IDs = 131072 + rank):**
+
+- `<s>` → 131073 (BOS), `</s>` → 131074 (EOS)
+- `[STREAMING_PAD]` → 131104 — "waiting" token
+- `[STREAMING_WORD]` → 131105 — word boundary

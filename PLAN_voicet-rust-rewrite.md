@@ -44,9 +44,8 @@ num_cpus = "1"                                        # mel spectrogram threadin
 clap = { version = "4", features = ["derive"] }       # CLI args
 anyhow = "1"                                          # error handling
 cpal = "0.15"                                         # mic capture
-ctrlc = "3"                                           # Ctrl+C handling
-# Future:
-# rdev = "0.5"                                        # global hotkeys (Phase 3)
+rdev = "0.5"                                          # global hotkeys + Ctrl+C
+enigo = "0.2"                                         # keyboard output (--type mode)
 ```
 
 ## Data Flow
@@ -174,69 +173,20 @@ This combines streaming inference + mic capture into one phase — there's no po
 
 **Validated** — Offline mode (`voicet <file.wav>`) produces identical output before and after all changes.
 
-### Phase 3: Hotkey mode + polish
+### Phase 3: Hotkey mode + polish — DONE
 
-Goal: feature parity with Python version.
+See [phase3.md](phase3.md) for full details.
 
-1. **Hotkey toggle** — `rdev` for global hotkey capture. Start/stop recording sessions.
-   1. Must be done in realtime with no lag. Only stops inference, keeps mic feed open.
-   2. Implement this very carefully as to avoid any additional first token lag compared to constant streaming. Analyze if this is even possible.
-   3. No cache reset or re-prefill needed:
-      1. Pause: stop calling run_processing_loop. Drain audio from channel and discard (prevent backlog). Keep
-         mel_buffer capped at CONV_CTX. GPU goes idle.
-      
-      2. Resume: just start calling run_processing_loop again. KV caches are intact. RoPE positions continue from
-         where they left off. No gaps.
-         
-         Resume latency is effectively 0ms — the next loop iteration just starts processing again. First token takes
-         ~53ms (one inference step), but the pipeline unpauses instantly.
-2. **Rolling prebuffer** — Keep last `first_chunk_samples` of audio while idle.
-3. **--type mode** — `enigo` crate for synthetic keyboard input.
-4. **CLI** — clap derive: `--device`, `--delay`, `--silence-threshold`, `--silence-flush`, `--hotkey`, `--type`
+Goal: daily-driver features — hotkey toggle, keyboard output, configurable CLI, robust silence detection.
 
-## Key weight name mapping
-
-The safetensors file uses **Mistral native naming** (not HuggingFace). 711 tensors total. We load from `consolidated.safetensors`.
-
-```
-Safetensors name                                                          → Rust struct field
-────────────────────────────────────────────────────────────────────────────────────────────────
-ENCODER (421 tensors)
-mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.0.conv.{weight,bias}  → encoder.conv_stem[0]
-mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers.1.conv.{weight,bias}  → encoder.conv_stem[1]
-mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.attention.{wq,wk,wv,wo}.{weight,bias}  → encoder.layers[i].attn
-mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.feed_forward.{w1,w2,w3}.{weight,bias}  → encoder.layers[i].mlp
-mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{i}.{attention_norm,ffn_norm}.weight  → encoder.layers[i].norms
-mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight  → encoder.final_norm
-
-ADAPTER (2 tensors)
-mm_streams_embeddings.embedding_module.audio_language_projection.0.weight  → adapter.linear_in   [3072, 5120]
-mm_streams_embeddings.embedding_module.audio_language_projection.2.weight  → adapter.linear_out  [3072, 3072]
-
-SHARED TOK_EMBEDDINGS (1 tensor — serves as embed + lm_head, tied weights)
-mm_streams_embeddings.embedding_module.tok_embeddings.weight  → shared.tok_embeddings  [131072, 3072]
-
-DECODER (287 tensors)
-layers.{i}.attention.{wq,wk,wv,wo}.weight         → decoder.layers[i].attn (GQA: 32Q/8KV heads)
-layers.{i}.{attention_norm,ffn_norm}.weight         → decoder.layers[i].norms
-layers.{i}.feed_forward.{w1,w2,w3}.weight           → decoder.layers[i].mlp
-layers.{i}.ada_rms_norm_t_cond.{0,2}.weight         → decoder.layers[i].ada_norm (bottleneck dim=32)
-norm.weight                                         → decoder.final_norm
-```
-
-**Key implementation notes:**
-
-- Q/K weights must be deinterleaved at load time via `deinterleave_qk()` — both encoder (32 heads, head_dim=64) and decoder (32Q/8KV heads, head_dim=128). V and O weights need no conversion.
-- Encoder has biases on wq, wv, wo, w2. Decoder has NO biases on any linear layer.
-- `candle-nn` must have `features = ["cuda"]` to unlock fused CUDA kernels (`rms_norm`, `softmax_last_dim`). Without it, these silently fall back to multi-op defaults.
-- KV cache uses flash attention layout `[batch, seq, heads, hdim]`. RoPE applies on this layout directly (no transpose needed).
-- candle `Tensor::sub` does not broadcast — use `.broadcast_sub()` etc.
-
-**Special tokens (from tekken.json, IDs = 131072 + rank):**
-
-- `<s>` → 131073 (BOS), `</s>` → 131074 (EOS)
-- `[STREAMING_PAD]` → 131104 — "waiting" token
-- `[STREAMING_WORD]` → 131105 — word boundary
+1. **CLI with clap derive** — `--device`, `--delay`, `--silence-threshold`, `--silence-flush`, `--min-speech`, `--rms-ema`, `--hotkey`, `--type`. Config table prints all runtime values at startup.
+2. **Hotkey toggle** — `rdev` low-level keyboard hook. Unified `spawn_listener()` handles both hotkey toggle (200ms debounce) and Ctrl+C detection (replaced `ctrlc` crate, which failed in PowerShell 7).
+3. **State machine** — Ready → Active ↔ Paused. Hotkey mode prefills on silence (instant startup). On pause, flushes `(delay_tokens + 4)` tokens of silence through the pipeline at GPU speed to emit remaining in-flight text. No silence/speech detection in hotkey mode.
+4. **Rolling prebuffer** — `VecDeque<f32>` capped at `delay_samples` (~400ms) captures audio while paused so speech before the hotkey press isn't lost. Flushed to IncrementalMel on resume.
+5. **`--type` mode** — `enigo` crate injects keystrokes into the focused app via `OutputSink` enum.
+6. **Silence/speech detection** (always-on mode) — Raw RMS for silence counting, EMA-smoothed RMS for speech detection (rides over inter-syllable dips). Minimum speech duration (`--min-speech`, default 8 chunks = 640ms) prevents paragraph breaks after short utterances.
+7. **Multi-channel mic** — Accepts native channel count, averages all channels to mono in the callback.
+8. **Dependencies** — Added `rdev`, `enigo`; removed `ctrlc`.
 
 ## What we're NOT doing
 

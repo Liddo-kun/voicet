@@ -31,12 +31,34 @@ pub struct StreamConfig {
     pub delay_tokens: usize,
     pub silence_threshold: f32,
     pub silence_chunks: usize,
+    pub min_speech_chunks: usize,
+    pub rms_ema_alpha: f32,
     pub hotkey: Option<rdev::Key>,
     pub type_mode: bool,
 }
 
 /// PCM samples per decoder token: MEL_FRAMES_PER_TOKEN × HOP_LENGTH.
 const SAMPLES_PER_TOKEN: usize = common::MEL_FRAMES_PER_TOKEN * mel::HOP_LENGTH;
+
+
+/// Debug status line at top of terminal (row 1). Uses ANSI save/restore cursor.
+fn debug_status(rms: f32, smooth: f32, config: &StreamConfig, silence_ctr: usize, speech_ctr: usize, emitted: bool) {
+    let w = 30;
+    let max = 0.03f32;
+    let level = ((smooth / max).min(1.0) * w as f32) as usize;
+    let tp = ((config.silence_threshold / max).min(1.0) * w as f32) as usize;
+    let mut bar = String::with_capacity(w);
+    for i in 0..w {
+        if i == tp { bar.push('|'); }
+        else if i < level { bar.push('\u{2588}'); }
+        else { bar.push('\u{2591}'); }
+    }
+    eprint!(
+        "\x1b[s\x1b[1;1H\x1b[K [{}] raw={:.4} ema={:.4} sil={}/{} spk={}/{} em={}\x1b[u",
+        bar, rms, smooth, silence_ctr, config.silence_chunks,
+        speech_ctr, config.min_speech_chunks, emitted,
+    );
+}
 
 // Incremental conv stem: keep 4 mel frames as context between iterations.
 const CONV_CTX: usize = 4;
@@ -73,8 +95,10 @@ impl OutputSink {
             }
             OutputSink::Keyboard(enigo) => {
                 use enigo::{Direction, Key, Keyboard};
+                let _ = enigo.key(Key::Shift, Direction::Press);
                 let _ = enigo.key(Key::Return, Direction::Click);
                 let _ = enigo.key(Key::Return, Direction::Click);
+                let _ = enigo.key(Key::Shift, Direction::Release);
             }
         }
     }
@@ -230,12 +254,7 @@ pub fn run_streaming(
         OutputSink::Stdout
     };
 
-    // Set up Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
 
     // Open mic
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
@@ -255,10 +274,10 @@ pub fn run_streaming(
             &silence, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
         )?;
 
-        // Set up hotkey state machine
+        // Set up hotkey state machine + Ctrl+C listener
         let hotkey_state = Arc::new(AtomicU8::new(hotkey::STATE_READY));
         let hotkey_key = config.hotkey.unwrap();
-        hotkey::spawn_hotkey_listener(hotkey_key, hotkey_state.clone());
+        hotkey::spawn_listener(running.clone(), Some(hotkey_key), Some(hotkey_state.clone()));
 
         eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", hotkey_key);
 
@@ -275,9 +294,6 @@ pub fn run_streaming(
         // pressing the hotkey isn't lost
         let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
 
-        let mut silence_counter: usize = 0;
-        let mut silence_emitted = false;
-        let mut sample_buf_for_silence: Vec<f32> = Vec::new();
         let mut prev_state_val = hotkey::STATE_READY;
 
         while running.load(Ordering::SeqCst) {
@@ -326,7 +342,6 @@ pub fn run_streaming(
                     if mel_buffer.len() > CONV_CTX {
                         mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
                     }
-                    sample_buf_for_silence.clear();
                     sink.emit_newline();
                 }
 
@@ -342,56 +357,28 @@ pub fn run_streaming(
                 let just_resumed = prev_state_val != hotkey::STATE_ACTIVE;
 
                 if just_resumed {
-                    // Flush prebuffer into IncrementalMel and silence detection buffer
                     let prebuf_samples: Vec<f32> = prebuffer.drain(..).collect();
                     if !prebuf_samples.is_empty() {
                         inc_mel.push_samples(&prebuf_samples);
-                        sample_buf_for_silence.extend_from_slice(&prebuf_samples);
                     }
-                    silence_counter = 0;
-                    // Start with silence_emitted = true so we don't emit a
-                    // paragraph break before the user has spoken anything.
-                    // It resets to false once speech is detected (RMS > threshold).
-                    silence_emitted = true;
                 }
 
                 if !new_16k.is_empty() {
                     inc_mel.push_samples(&new_16k);
-                    sample_buf_for_silence.extend_from_slice(&new_16k);
                 }
 
-                // Drain mel frames
                 mel_buffer.extend(inc_mel.drain_frames());
 
-                // Silence detection
-                while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
-                    let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
-                        .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
-                    sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
-                    if rms < config.silence_threshold {
-                        silence_counter += 1;
-                    } else {
-                        silence_counter = 0;
-                        silence_emitted = false;
-                    }
-                }
-
-                // Process tokens
                 let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
                     &mut mel_buffer, device, dtype, &mut sink)?;
                 if eos { break; }
-
-                // Silence flush
-                if silence_counter >= config.silence_chunks && !silence_emitted {
-                    sink.emit_newline();
-                    silence_emitted = true;
-                }
             }
 
             prev_state_val = current_state_val;
         }
     } else {
         // ---- Always-on mode: original behavior ----
+        hotkey::spawn_listener(running.clone(), None, None);
         let mut samples_16k: Vec<f32> = Vec::new();
         eprintln!("Buffering {:.0}ms of audio for startup...", delay_samples_count as f64 / 16.0);
 
@@ -435,6 +422,8 @@ pub fn run_streaming(
         }
 
         let mut silence_counter: usize = 0;
+        let mut speech_counter: usize = 0;
+        let mut smoothed_rms: f32 = 0.0;
         // Start true so we don't emit a paragraph break before the user speaks.
         let mut silence_emitted = true;
         let mut sample_buf_for_silence: Vec<f32> = leftover;
@@ -463,12 +452,23 @@ pub fn run_streaming(
                 let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
                     .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
                 sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
+                smoothed_rms = config.rms_ema_alpha * rms + (1.0 - config.rms_ema_alpha) * smoothed_rms;
+                // Raw RMS for silence detection (responsive to actual quiet)
                 if rms < config.silence_threshold {
                     silence_counter += 1;
                 } else {
                     silence_counter = 0;
-                    silence_emitted = false;
                 }
+                // Smoothed RMS for speech detection (rides over inter-syllable dips)
+                if smoothed_rms >= config.silence_threshold {
+                    speech_counter += 1;
+                    if speech_counter >= config.min_speech_chunks {
+                        silence_emitted = false;
+                    }
+                } else {
+                    speech_counter = 0;
+                }
+                debug_status(rms, smoothed_rms, config, silence_counter, speech_counter, silence_emitted);
             }
 
             let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
@@ -522,8 +522,9 @@ fn open_mic(tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32)> {
     let native_channels = default_config.channels();
     eprintln!("Native config: {}Hz, {} ch", native_rate, native_channels);
 
+    // Use native channel count — some devices reject mono requests
     let config = cpal::StreamConfig {
-        channels: 1,
+        channels: native_channels,
         sample_rate: cpal::SampleRate(native_rate),
         buffer_size: cpal::BufferSize::Default,
     };
@@ -532,10 +533,25 @@ fn open_mic(tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32)> {
         eprintln!("Will resample {}Hz -> 16kHz on inference thread", native_rate);
     }
 
+    let ch = native_channels as usize;
     let stream = input_device.build_input_stream(
         &config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let _ = tx.send(data.to_vec());
+            if ch == 1 {
+                let _ = tx.send(data.to_vec());
+            } else {
+                // Downmix to mono by averaging all channels per frame
+                let mut mono = vec![0.0f32; data.len() / ch];
+                let scale = 1.0 / ch as f32;
+                for (i, frame) in data.chunks_exact(ch).enumerate() {
+                    let mut sum = 0.0f32;
+                    for &s in frame {
+                        sum += s;
+                    }
+                    mono[i] = sum * scale;
+                }
+                let _ = tx.send(mono);
+            }
         },
         |err| {
             eprintln!("Audio input error: {}", err);

@@ -29,16 +29,24 @@ struct Cli {
     device: usize,
 
     /// Delay tokens (1-30, higher = more accuracy, more latency; each token = 80ms)
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 3)]
     delay: usize,
 
     /// Silence RMS threshold for paragraph breaks
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.007)]
     silence_threshold: f32,
 
-    /// Silence chunks before paragraph break (default: delay + 6)
+    /// Silence chunks before paragraph break (default: delay + 9)
     #[arg(long)]
     silence_flush: Option<usize>,
+
+    /// Minimum speech chunks before silence detection activates (each chunk = 80ms)
+    #[arg(long, default_value_t = 8)]
+    min_speech: usize,
+
+    /// EMA smoothing factor for speech detection (0.0-1.0, lower = smoother)
+    #[arg(long, default_value_t = 0.3)]
+    rms_ema: f32,
 
     /// Hotkey to toggle recording (e.g. F9, ScrollLock, Pause)
     #[arg(long)]
@@ -68,7 +76,7 @@ fn main() -> Result<()> {
         .map(hotkey::parse_hotkey)
         .transpose()?;
 
-    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 6);
+    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 9);
 
     // Match PyTorch's default BF16 matmul behavior (reduced precision accumulation)
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
@@ -89,6 +97,9 @@ fn main() -> Result<()> {
         "Silence threshold", cli.silence_threshold, cli.silence_threshold);
     println!("{:<28} {} ({}ms)",
         "Silence newline after", silence_chunks, silence_chunks * 80);
+    println!("{:<28} {} ({}ms)",
+        "Min speech to activate", cli.min_speech, cli.min_speech * 80);
+    println!("{:<28} {}", "RMS EMA alpha", cli.rms_ema);
     if let Some(ref key) = hotkey_key {
         println!("{:<28} {:?}", "Hotkey", key);
     }
@@ -125,6 +136,8 @@ fn main() -> Result<()> {
         delay_tokens: cli.delay,
         silence_threshold: cli.silence_threshold,
         silence_chunks,
+        min_speech_chunks: cli.min_speech,
+        rms_ema_alpha: cli.rms_ema,
         hotkey: hotkey_key,
         type_mode: cli.type_mode,
     };
