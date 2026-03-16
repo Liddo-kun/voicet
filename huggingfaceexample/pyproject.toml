@@ -1,0 +1,22 @@
+[project]
+name = "voicet"
+version = "0.1.0"
+description = "Real-time microphone transcription using Voxtral-Mini-4B"
+requires-python = ">=3.12"
+dependencies = [
+    "transformers>=4.52.0",
+    "mistral-common[audio]>=1.5.0",
+    "sounddevice",
+    "soundfile",
+    "librosa",
+    "soxr",
+    "numpy",
+    "pynput",
+]
+
+[project.scripts]
+voicet = "voicet:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"

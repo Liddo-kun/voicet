@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{Linear, VarBuilder};
 
-use crate::common::{deinterleave_qk, KvCache, RmsNorm, RotaryEmbedding};
+use crate::common::{deinterleave_qk, DeinterleaveIdx, KvCache, RmsNorm, RotaryEmbedding};
 
 // Encoder hyperparameters from config.json
 pub const HIDDEN_SIZE: usize = 1280;
@@ -35,20 +35,20 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(vb: &VarBuilder, layer_prefix: &str) -> Result<Self> {
+    fn load(vb: &VarBuilder, layer_prefix: &str, idx: &DeinterleaveIdx) -> Result<Self> {
         let attn_prefix = format!("{layer_prefix}.attention");
         let qkv_in = HIDDEN_SIZE;
         let qkv_out = NUM_HEADS * HEAD_DIM; // 32 * 64 = 2048
 
         // wq has bias — weight is in Mistral interleaved format, deinterleave to HF paired-halves
         let wq_w = vb.get(&[qkv_out, qkv_in], &format!("{attn_prefix}.wq.weight"))?;
-        let wq_w = deinterleave_qk(&wq_w, NUM_HEADS, HEAD_DIM)?;
+        let wq_w = deinterleave_qk(&wq_w, NUM_HEADS, HEAD_DIM, idx)?;
         let wq_b = vb.get(&[qkv_out], &format!("{attn_prefix}.wq.bias"))?;
         let wq = Linear::new(wq_w, Some(wq_b));
 
         // wk has NO bias — also deinterleave
         let wk_w = vb.get(&[qkv_out, qkv_in], &format!("{attn_prefix}.wk.weight"))?;
-        let wk_w = deinterleave_qk(&wk_w, NUM_KV_HEADS, HEAD_DIM)?;
+        let wk_w = deinterleave_qk(&wk_w, NUM_KV_HEADS, HEAD_DIM, idx)?;
         let wk = Linear::new(wk_w, None);
 
         // wv has bias
@@ -146,10 +146,10 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn load(vb: &VarBuilder, layer_idx: usize) -> Result<Self> {
+    fn load(vb: &VarBuilder, layer_idx: usize, idx: &DeinterleaveIdx) -> Result<Self> {
         let layer_prefix = format!("{PREFIX}.transformer.layers.{layer_idx}");
 
-        let attention = Attention::load(vb, &layer_prefix)?;
+        let attention = Attention::load(vb, &layer_prefix, idx)?;
         let attention_norm = RmsNorm::load(vb, &format!("{layer_prefix}.attention_norm.weight"), HIDDEN_SIZE, RMS_NORM_EPS)?;
         let mlp = Mlp::load(vb, &layer_prefix)?;
         let ffn_norm = RmsNorm::load(vb, &format!("{layer_prefix}.ffn_norm.weight"), HIDDEN_SIZE, RMS_NORM_EPS)?;
@@ -227,9 +227,10 @@ impl AudioEncoder {
         let conv2 = Conv1dLayer::load(vb, 1, HIDDEN_SIZE, HIDDEN_SIZE, 2)?;
 
         println!("  Loading {} transformer layers...", NUM_LAYERS);
+        let deinterleave_idx = DeinterleaveIdx::new(HEAD_DIM, device)?;
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for i in 0..NUM_LAYERS {
-            layers.push(EncoderLayer::load(vb, i)
+            layers.push(EncoderLayer::load(vb, i, &deinterleave_idx)
                 .with_context(|| format!("loading encoder layer {i}"))?);
             if (i + 1) % 8 == 0 {
                 println!("    Loaded {}/{} layers", i + 1, NUM_LAYERS);

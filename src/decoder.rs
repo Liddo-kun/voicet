@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
-use crate::common::{self, deinterleave_qk, KvCache, RmsNorm, RotaryEmbedding};
+use crate::common::{self, deinterleave_qk, DeinterleaveIdx, KvCache, RmsNorm, RotaryEmbedding};
 use crate::tokenizer;
 
 // Decoder hyperparameters
@@ -49,15 +49,15 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(vb: &VarBuilder, layer_idx: usize) -> Result<Self> {
+    fn load(vb: &VarBuilder, layer_idx: usize, idx: &DeinterleaveIdx) -> Result<Self> {
         let prefix = format!("layers.{layer_idx}.attention");
 
         let wq_w = vb.get(&[NUM_HEADS * HEAD_DIM, HIDDEN_SIZE], &format!("{prefix}.wq.weight"))?;
-        let wq_w = deinterleave_qk(&wq_w, NUM_HEADS, HEAD_DIM)?;
+        let wq_w = deinterleave_qk(&wq_w, NUM_HEADS, HEAD_DIM, idx)?;
         let wq = Linear::new(wq_w, None);
 
         let wk_w = vb.get(&[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE], &format!("{prefix}.wk.weight"))?;
-        let wk_w = deinterleave_qk(&wk_w, NUM_KV_HEADS, HEAD_DIM)?;
+        let wk_w = deinterleave_qk(&wk_w, NUM_KV_HEADS, HEAD_DIM, idx)?;
         let wk = Linear::new(wk_w, None);
 
         let wv_w = vb.get(&[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE], &format!("{prefix}.wv.weight"))?;
@@ -180,8 +180,8 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn load(vb: &VarBuilder, layer_idx: usize) -> Result<Self> {
-        let attention = Attention::load(vb, layer_idx)?;
+    fn load(vb: &VarBuilder, layer_idx: usize, idx: &DeinterleaveIdx) -> Result<Self> {
+        let attention = Attention::load(vb, layer_idx, idx)?;
         let attention_norm = RmsNorm::load(vb, &format!("layers.{layer_idx}.attention_norm.weight"), HIDDEN_SIZE, RMS_NORM_EPS)?;
         let mlp = Mlp::load(vb, layer_idx)?;
         let ffn_norm = RmsNorm::load(vb, &format!("layers.{layer_idx}.ffn_norm.weight"), HIDDEN_SIZE, RMS_NORM_EPS)?;
@@ -252,9 +252,10 @@ pub struct TextDecoder {
 impl TextDecoder {
     pub fn load(vb: &VarBuilder, device: &Device, dtype: DType) -> Result<Self> {
         println!("  Loading {} decoder layers...", NUM_LAYERS);
+        let deinterleave_idx = DeinterleaveIdx::new(HEAD_DIM, device)?;
         let mut layers = Vec::with_capacity(NUM_LAYERS);
         for i in 0..NUM_LAYERS {
-            layers.push(DecoderLayer::load(vb, i)
+            layers.push(DecoderLayer::load(vb, i, &deinterleave_idx)
                 .with_context(|| format!("loading decoder layer {i}"))?);
             if (i + 1) % 10 == 0 || i + 1 == NUM_LAYERS {
                 println!("    Loaded {}/{} layers", i + 1, NUM_LAYERS);

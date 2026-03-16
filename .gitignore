@@ -2,3 +2,10 @@
 /target2/
 Voxtral-Mini-4B-Realtime/
 .claude/settings.local.json
+voicet-v*.zip
+voicet-v*.tar.gz
+release/
+release-linux/
+learnings*.md
+MistralDoc.md
+plan2xxx.md

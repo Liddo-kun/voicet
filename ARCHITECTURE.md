@@ -189,8 +189,19 @@ Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook),
 | 11  | Large encoder chunks      | `encoder.rs` | Offline `forward()` uses chunks of `SLIDING_WINDOW / 2` (375 frames) instead of `CHUNK_SIZE` (4 frames). Larger matmuls saturate GPU compute units. Encoder time on 5min audio: 53s → 1s (52x speedup). Streaming still uses 4-frame chunks via `forward_chunk()`. |
 | 12  | Auto delay=20 for offline | `main.rs`    | Offline transcription auto-overrides delay to 20 (1600ms lookahead) regardless of `--delay` flag. No latency penalty offline, so maximum accuracy is free.                                                                                                         |
 
+### Model Loading Optimizations
+
+Reduced end to end loading of voice..exe: CUDA runtimes + model load to GPU from ~4s to 2.94s on Arrow Lake + RTX 5080 by:
+
+| #   | Optimization                     | File(s)                                 | What it does                                                                                                                                                                                                                                          |
+| --- | -------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 13  | Precomputed deinterleave indices | `common.rs`, `encoder.rs`, `decoder.rs` | `DeinterleaveIdx` struct creates even/odd GPU index tensors once per head_dim (64 for encoder, 128 for decoder). Reused across all layers. 4 total CUDA allocations + H2D transfers instead of 232 (116 calls × 2 tensors each).                      |
+| 14  | mmap readahead thread            | `main.rs`                               | Background thread pre-faults mmap pages at full sequential NVMe bandwidth. Spawned *before* CUDA init so it gets ~0.5-1s head start. Pages are in OS cache by the time `vb.get()` copies tensors to GPU — eliminates per-tensor page-fault stalls.    |
+| 15  | Deferred mmap cleanup            | `main.rs`                               | `vb` and `st_data` are not explicitly dropped after loading — they live until process exit. Avoids a ~0.6s `munmap` syscall that tears down page table entries for ~2.25M pages (9GB / 4KB). OS reclaims physical pages lazily under memory pressure. |
+
 ### Measured Performance (RTX 5080)
 
+- **Cold model load**: 2.94s (Arrow Lake + RTX 5080)
 - **Streaming**: ~30ms per tick (encoder chunk + decoder step), well within 80ms budget
 - **Offline decoding**: 63 tok/s (0.20x real-time factor on 5min audio)
 - **Offline encoder**: 1.0s for 5min audio (14,880 frames)

@@ -12,6 +12,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use std::fs;
+use std::sync::Arc;
 use std::time::Instant;
 
 use common::{argmax_last, MEL_FRAMES_PER_TOKEN};
@@ -80,10 +81,27 @@ fn main() -> Result<()> {
 
     let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 9);
 
+    // mmap the safetensors file (instant — no disk I/O yet) and spawn readahead
+    // thread to pre-fault pages at full sequential bandwidth. Starting this before
+    // CUDA init gives the readahead a ~0.5-1s head start.
+    println!("Loading safetensors...");
+    let st_path = format!("{}/consolidated.safetensors", cli.model_dir);
+    let st_data = Arc::new(unsafe { memmap2::Mmap::map(&fs::File::open(&st_path)?)? });
+    let readahead = {
+        let data = Arc::clone(&st_data);
+        std::thread::spawn(move || {
+            let mut dummy = 0u8;
+            for i in (0..data.len()).step_by(4096) {
+                dummy = dummy.wrapping_add(data[i]);
+            }
+            std::hint::black_box(dummy);
+        })
+    };
+
     // Match PyTorch's default BF16 matmul behavior (reduced precision accumulation)
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
 
-    // --- Setup ---
+    // --- Setup (CUDA init runs while readahead pre-faults pages) ---
     let device = Device::cuda_if_available(cli.device)?;
     let dtype = DType::BF16;
 
@@ -115,9 +133,6 @@ fn main() -> Result<()> {
     println!("{:<28} {:?}", "Compute dtype", dtype);
     println!();
 
-    println!("Loading safetensors...");
-    let st_path = format!("{}/consolidated.safetensors", cli.model_dir);
-    let st_data = unsafe { memmap2::Mmap::map(&fs::File::open(&st_path)?)? };
     let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, &device)?;
 
     let t_total = Instant::now();
@@ -135,6 +150,7 @@ fn main() -> Result<()> {
     let mut dec = decoder::TextDecoder::load(&vb, &device, dtype)?;
 
     println!("Total model load: {:.2}s", t_total.elapsed().as_secs_f64());
+    let _ = readahead.join();
 
     let filters = mel::mel_filters(&cli.model_dir);
 

@@ -148,16 +148,30 @@ pub fn argmax_last(logits: &Tensor) -> candle_core::Result<u32> {
 // ---- Deinterleave Q/K weights ----
 // Mistral's consolidated.safetensors stores Q/K weights in interleaved format.
 // Deinterleave at load time so rotate_half RoPE works correctly.
-pub fn deinterleave_qk(w: &Tensor, num_heads: usize, head_dim: usize) -> candle_core::Result<Tensor> {
+
+/// Precomputed GPU index tensors for deinterleave_qk. One per head_dim value.
+/// Avoids creating identical small GPU tensors on every call (228 → 4 allocations).
+pub struct DeinterleaveIdx {
+    even: Tensor,
+    odd: Tensor,
+}
+
+impl DeinterleaveIdx {
+    pub fn new(head_dim: usize, device: &Device) -> candle_core::Result<Self> {
+        let half = head_dim / 2;
+        let even: Vec<u32> = (0..head_dim as u32).step_by(2).collect();
+        let odd: Vec<u32> = (1..head_dim as u32).step_by(2).collect();
+        Ok(Self {
+            even: Tensor::from_vec(even, (half,), device)?,
+            odd: Tensor::from_vec(odd, (half,), device)?,
+        })
+    }
+}
+
+pub fn deinterleave_qk(w: &Tensor, num_heads: usize, head_dim: usize, idx: &DeinterleaveIdx) -> candle_core::Result<Tensor> {
     let in_features = w.dim(1)?;
-    let half = head_dim / 2;
     let w = w.reshape((num_heads, head_dim, in_features))?;
-    let device = w.device();
-    let even_idx: Vec<u32> = (0..head_dim as u32).step_by(2).collect();
-    let odd_idx: Vec<u32> = (1..head_dim as u32).step_by(2).collect();
-    let even_idx = Tensor::from_vec(even_idx, (half,), device)?;
-    let odd_idx = Tensor::from_vec(odd_idx, (half,), device)?;
-    let first_half = w.index_select(&even_idx, 1)?;
-    let second_half = w.index_select(&odd_idx, 1)?;
+    let first_half = w.index_select(&idx.even, 1)?;
+    let second_half = w.index_select(&idx.odd, 1)?;
     Tensor::cat(&[&first_half, &second_half], 1)?.reshape((num_heads * head_dim, in_features))
 }
