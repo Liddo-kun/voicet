@@ -6,7 +6,7 @@ Ultrafast, ultra efficient Real-time (live) speech-to-text on your GPU. No cloud
 
 Support for RTX 3000 series and up (>11gb VRAM); DGX Spark [untested]. Windows/Linux
 
-I found it to be slightly faster then speechmatics (probably because it's local) and just as accurate.
+I found it to be slightly faster than speechmatics (probably because it's local) and just as accurate.
 
 [Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) is a relatively large model for speech to text, but in return it gets you insanely low latency and high accuracy. So I built this app on top of it to optimize the best I could.
 
@@ -16,7 +16,7 @@ Automatic paragraph breaks on speech pauses (configurable)
 
 ## Features
 
-Fastest implementation of Voxtral Voxtral Mini 4B Realtime in CUDA on the web. 5x realtime on RTX 5080.
+Fastest implementation of Voxtral Mini 4B Realtime in CUDA on the web. 5x realtime on RTX 5080.
 
 Type mode [--type] supports dictation directly into your text editor  (Word, Claude Code). Just speak and words appear.
 
@@ -56,7 +56,7 @@ Other features: Resumable requests. Processes audio pipeline in parallel with gp
 
 - NVIDIA GPU with CUDA support (tested on RTX 5080)
 - [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) installed (Linux only - included for Windows release)
-- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into a the voicet.exe directory. You only need consolidated.safetensors and tekken.json
+- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into the voicet.exe directory. You only need consolidated.safetensors and tekken.json
 
 ### Build
 
