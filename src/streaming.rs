@@ -246,7 +246,6 @@ pub fn run_streaming(
     config: &StreamConfig,
 ) -> Result<()> {
     let delay_samples_count = (1 + config.delay_tokens) * SAMPLES_PER_TOKEN;
-    let hotkey_mode = config.hotkey.is_some();
 
     // Initialize output sink
     let mut sink = if config.type_mode {
@@ -268,200 +267,132 @@ pub fn run_streaming(
     let ratio_int = resample_ratio as usize;
     let mut raw_buf: Vec<f32> = Vec::new();
 
-    if hotkey_mode {
-        // ---- Hotkey mode: startup with silence, toggle with hotkey ----
-        let silence = vec![0.0f32; delay_samples_count];
-        eprintln!("Running startup with silence ({} samples)...", silence.len());
-        let mut state = run_startup(
-            &silence, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
-        )?;
+    // Startup with silence — model is ready, real audio goes through incremental path
+    let silence = vec![0.0f32; delay_samples_count];
+    eprintln!("Running startup with silence ({} samples)...", silence.len());
+    let mut state = run_startup(
+        &silence, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
+    )?;
 
-        // Set up hotkey state machine + Ctrl+C listener
-        let hotkey_state = Arc::new(AtomicU8::new(hotkey::STATE_READY));
-        let hotkey_key = config.hotkey.unwrap();
-        hotkey::spawn_listener(running.clone(), Some(hotkey_key), Some(hotkey_state.clone()));
+    // State machine: with hotkey starts READY (waiting for press),
+    // without hotkey starts ACTIVE (recording immediately)
+    let initial_state = if config.hotkey.is_some() {
+        hotkey::STATE_READY
+    } else {
+        hotkey::STATE_ACTIVE
+    };
+    let hotkey_state = Arc::new(AtomicU8::new(initial_state));
+    hotkey::spawn_listener(running.clone(), config.hotkey, Some(hotkey_state.clone()));
 
-        eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", hotkey_key);
+    if let Some(key) = config.hotkey {
+        eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", key);
+    } else {
+        eprintln!("\n--- Listening (Ctrl+C to stop) ---\n");
+    }
 
-        // Keep only last CONV_CTX mel frames as conv stem context
-        let mel_len = state.mel_frames.len();
-        let ctx_start = mel_len.saturating_sub(CONV_CTX);
-        let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
-        drop(std::mem::take(&mut state.mel_frames));
+    // Keep only last CONV_CTX mel frames as conv stem context
+    let mel_len = state.mel_frames.len();
+    let ctx_start = mel_len.saturating_sub(CONV_CTX);
+    let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
+    drop(std::mem::take(&mut state.mel_frames));
 
-        // Fresh IncrementalMel — will apply reflect padding on first real audio push
-        let mut inc_mel = IncrementalMel::new(filters);
+    let mut inc_mel = IncrementalMel::new(filters);
+    let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
 
-        // Rolling prebuffer: captures audio while paused so speech just before
-        // pressing the hotkey isn't lost
-        let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
+    // Silence detection state
+    let mut silence_counter: usize = 0;
+    let mut speech_counter: usize = 0;
+    let mut smoothed_rms: f32 = 0.0;
+    let mut silence_emitted = true;
+    let mut sample_buf_for_silence: Vec<f32> = Vec::new();
 
-        let mut prev_state_val = hotkey::STATE_READY;
+    let mut prev_state_val = initial_state;
 
-        while running.load(Ordering::SeqCst) {
-            let current_state_val = hotkey_state.load(Ordering::SeqCst);
+    while running.load(Ordering::SeqCst) {
+        let current_state_val = hotkey_state.load(Ordering::SeqCst);
 
-            // Pull audio from channel
-            let mut new_16k = Vec::new();
-            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(chunk) => {
-                    raw_buf.extend_from_slice(&chunk);
-                    while let Ok(more) = rx.try_recv() {
-                        raw_buf.extend_from_slice(&more);
-                    }
-                    resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
+        // Pull audio from channel
+        let mut new_16k = Vec::new();
+        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(chunk) => {
+                raw_buf.extend_from_slice(&chunk);
+                while let Ok(more) = rx.try_recv() {
+                    raw_buf.extend_from_slice(&more);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
 
-            if current_state_val == hotkey::STATE_READY || current_state_val == hotkey::STATE_PAUSED {
-                // ---- Ready/Paused: feed rolling prebuffer, don't process ----
+        if current_state_val == hotkey::STATE_READY || current_state_val == hotkey::STATE_PAUSED {
+            // ---- Ready/Paused: feed rolling prebuffer, don't process ----
 
-                // Detect Active → Paused transition: flush decoder's lookahead
-                if prev_state_val == hotkey::STATE_ACTIVE {
-                    // Feed any final real audio still in new_16k
-                    if !new_16k.is_empty() {
-                        inc_mel.push_samples(&new_16k);
-                        new_16k.clear();
-                    }
-
-                    // Push (delay_tokens + 4) tokens of silence to flush the
-                    // decoder's lookahead buffer. The decoder will emit PAD tokens
-                    // for the silence, which emit_token ignores.
-                    let flush_samples = (config.delay_tokens + 4) * SAMPLES_PER_TOKEN;
-                    let silence = vec![0.0f32; flush_samples];
-                    inc_mel.push_samples(&silence);
-
-                    // Drain all mel frames and run processing to completion
-                    mel_buffer.extend(inc_mel.drain_frames());
-                    let _ = run_processing_loop(
-                        enc, adapter, dec, tok, &mut state,
-                        &mut mel_buffer, device, dtype, &mut sink,
-                    )?;
-
-                    // Now truncate and go idle
-                    if mel_buffer.len() > CONV_CTX {
-                        mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
-                    }
-                    sink.emit_newline();
-                }
-
-                // Feed prebuffer (capped at delay_samples_count)
-                for &s in &new_16k {
-                    if prebuffer.len() >= delay_samples_count {
-                        prebuffer.pop_front();
-                    }
-                    prebuffer.push_back(s);
-                }
-            } else {
-                // ---- Active: process audio ----
-                let just_resumed = prev_state_val != hotkey::STATE_ACTIVE;
-
-                if just_resumed {
-                    let prebuf_samples: Vec<f32> = prebuffer.drain(..).collect();
-                    if !prebuf_samples.is_empty() {
-                        inc_mel.push_samples(&prebuf_samples);
-                    }
-                }
-
+            // Detect Active → Paused transition: flush decoder's lookahead
+            if prev_state_val == hotkey::STATE_ACTIVE {
                 if !new_16k.is_empty() {
                     inc_mel.push_samples(&new_16k);
+                    new_16k.clear();
                 }
+
+                let flush_samples = (config.delay_tokens + 4) * SAMPLES_PER_TOKEN;
+                let flush_silence = vec![0.0f32; flush_samples];
+                inc_mel.push_samples(&flush_silence);
 
                 mel_buffer.extend(inc_mel.drain_frames());
+                let _ = run_processing_loop(
+                    enc, adapter, dec, tok, &mut state,
+                    &mut mel_buffer, device, dtype, &mut sink,
+                )?;
 
-                let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
-                    &mut mel_buffer, device, dtype, &mut sink)?;
-                if eos { break; }
-            }
-
-            prev_state_val = current_state_val;
-        }
-    } else {
-        // ---- Always-on mode: original behavior ----
-        hotkey::spawn_listener(running.clone(), None, None);
-        let mut samples_16k: Vec<f32> = Vec::new();
-        eprintln!("Buffering {:.0}ms of audio for startup...", delay_samples_count as f64 / 16.0);
-
-        while samples_16k.len() < delay_samples_count && running.load(Ordering::SeqCst) {
-            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(chunk) => raw_buf.extend_from_slice(&chunk),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            }
-            while let Ok(more) = rx.try_recv() {
-                raw_buf.extend_from_slice(&more);
-            }
-            resample(&mut raw_buf, &mut samples_16k, need_resample, ratio_int);
-        }
-
-        if samples_16k.len() < delay_samples_count {
-            anyhow::bail!("Not enough audio for startup");
-        }
-
-        let delay = samples_16k[..delay_samples_count].to_vec();
-        let leftover = samples_16k[delay_samples_count..].to_vec();
-
-        eprintln!("Running startup with {} delay samples...", delay.len());
-        let mut state = run_startup(
-            &delay, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
-        )?;
-
-        eprintln!("\n--- Listening (Ctrl+C to stop) ---\n");
-
-        let mel_len = state.mel_frames.len();
-        let ctx_start = mel_len.saturating_sub(CONV_CTX);
-        let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
-        drop(std::mem::take(&mut state.mel_frames));
-
-        let left_ctx_len = (mel::N_FFT / 2).min(delay.len());
-        let left_ctx = &delay[delay.len() - left_ctx_len..];
-        let mut inc_mel = IncrementalMel::with_left_context(filters, left_ctx);
-
-        if !leftover.is_empty() {
-            inc_mel.push_samples(&leftover);
-        }
-
-        let mut silence_counter: usize = 0;
-        let mut speech_counter: usize = 0;
-        let mut smoothed_rms: f32 = 0.0;
-        // Start true so we don't emit a paragraph break before the user speaks.
-        let mut silence_emitted = true;
-        let mut sample_buf_for_silence: Vec<f32> = leftover;
-
-        while running.load(Ordering::SeqCst) {
-            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(chunk) => {
-                    raw_buf.extend_from_slice(&chunk);
-                    while let Ok(more) = rx.try_recv() {
-                        raw_buf.extend_from_slice(&more);
-                    }
-                    let mut new_16k = Vec::new();
-                    resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
-                    if !new_16k.is_empty() {
-                        inc_mel.push_samples(&new_16k);
-                        sample_buf_for_silence.extend_from_slice(&new_16k);
-                    }
+                if mel_buffer.len() > CONV_CTX {
+                    mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                sink.emit_newline();
+
+                // Reset silence detection
+                silence_counter = 0;
+                speech_counter = 0;
+                smoothed_rms = 0.0;
+                silence_emitted = true;
+                sample_buf_for_silence.clear();
+            }
+
+            // Feed prebuffer (capped at delay_samples_count)
+            for &s in &new_16k {
+                if prebuffer.len() >= delay_samples_count {
+                    prebuffer.pop_front();
+                }
+                prebuffer.push_back(s);
+            }
+        } else {
+            // ---- Active: process audio ----
+            if prev_state_val != hotkey::STATE_ACTIVE {
+                // Just resumed: flush prebuffer into mel
+                let prebuf_samples: Vec<f32> = prebuffer.drain(..).collect();
+                if !prebuf_samples.is_empty() {
+                    inc_mel.push_samples(&prebuf_samples);
+                }
+            }
+
+            if !new_16k.is_empty() {
+                inc_mel.push_samples(&new_16k);
+                sample_buf_for_silence.extend_from_slice(&new_16k);
             }
 
             mel_buffer.extend(inc_mel.drain_frames());
 
+            // Silence detection
             while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
                 let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
                     .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
                 sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
                 smoothed_rms = config.rms_ema_alpha * rms + (1.0 - config.rms_ema_alpha) * smoothed_rms;
-                // Raw RMS for silence detection (responsive to actual quiet)
                 if rms < config.silence_threshold {
                     silence_counter += 1;
                 } else {
                     silence_counter = 0;
                 }
-                // Smoothed RMS for speech detection (rides over inter-syllable dips)
                 if smoothed_rms >= config.silence_threshold {
                     speech_counter += 1;
                     if speech_counter >= config.min_speech_chunks {
@@ -482,6 +413,8 @@ pub fn run_streaming(
                 silence_emitted = true;
             }
         }
+
+        prev_state_val = current_state_val;
     }
 
     eprintln!("\n--- Stopped ---");
