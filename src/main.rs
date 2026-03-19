@@ -202,12 +202,8 @@ fn main() -> Result<()> {
             let running = running.unwrap();
             let hotkey_thread_id = hotkey_thread_id.unwrap();
 
-            // Model loaded — transition from Loading to operational state
-            let initial_state = if has_hotkey {
-                hotkey::STATE_PAUSED
-            } else {
-                hotkey::STATE_ACTIVE
-            };
+            // Model loaded — always start active
+            let initial_state = hotkey::STATE_ACTIVE;
             settings.state.store(initial_state, Ordering::SeqCst);
 
             println!("\n=== Voicet Streaming Mode ===\n");

@@ -73,7 +73,7 @@ impl Default for IniValues {
             min_speech_chunks: 12,
             rms_ema_alpha: 0.3,
             hotkey: None,
-            type_mode: false,
+            type_mode: true,
         }
     }
 }
