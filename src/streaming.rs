@@ -303,7 +303,7 @@ pub fn run_streaming(
 
         // Pull audio from channel
         let mut new_16k = Vec::new();
-        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
             Ok(chunk) => {
                 raw_buf.extend_from_slice(&chunk);
                 while let Ok(more) = rx.try_recv() {
@@ -373,8 +373,8 @@ pub fn run_streaming(
                 sample_buf_for_silence.clear();
             }
 
-            // Feed prebuffer (capped to current delay)
-            let prebuf_cap = (1 + local_delay) * SAMPLES_PER_TOKEN;
+            // Feed prebuffer (160ms — captures speech just before hotkey press)
+            let prebuf_cap = 2 * SAMPLES_PER_TOKEN;
             for &s in &new_16k {
                 if prebuffer.len() >= prebuf_cap {
                     prebuffer.pop_front();
