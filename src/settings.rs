@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 use crate::hotkey;
 
+pub const SILENCE_CHUNKS_DEFAULT: usize = 20;
+
 /// Atomic f32 via bit reinterpretation (no std AtomicF32).
 pub struct AtomicF32(AtomicU32);
 
@@ -28,6 +30,7 @@ impl AtomicF32 {
 pub struct SharedSettings {
     pub silence_threshold: AtomicF32,
     pub silence_chunks: AtomicUsize,
+    pub paragraph_delay_offset: AtomicUsize,
     pub min_speech_chunks: AtomicUsize,
     pub rms_ema_alpha: AtomicF32,
     pub delay_tokens: AtomicUsize,
@@ -37,12 +40,11 @@ pub struct SharedSettings {
 }
 
 impl SharedSettings {
-    /// Construct from resolved IniValues. `silence_chunks` and `initial_state`
-    /// are passed separately because they're computed from other values.
     pub fn new(vals: IniValues, silence_chunks: usize, initial_state: u8) -> Self {
         Self {
             silence_threshold: AtomicF32::new(vals.silence_threshold),
             silence_chunks: AtomicUsize::new(silence_chunks),
+            paragraph_delay_offset: AtomicUsize::new(vals.paragraph_delay_offset),
             min_speech_chunks: AtomicUsize::new(vals.min_speech_chunks),
             rms_ema_alpha: AtomicF32::new(vals.rms_ema_alpha),
             delay_tokens: AtomicUsize::new(vals.delay),
@@ -58,6 +60,7 @@ pub struct IniValues {
     pub delay: usize,
     pub silence_threshold: f32,
     pub silence_chunks: Option<usize>,
+    pub paragraph_delay_offset: usize,
     pub min_speech_chunks: usize,
     pub rms_ema_alpha: f32,
     pub hotkey: Option<rdev::Key>,
@@ -70,7 +73,8 @@ impl Default for IniValues {
             delay: 4,
             silence_threshold: 0.006,
             silence_chunks: None,
-            min_speech_chunks: 12,
+            paragraph_delay_offset: 4,
+            min_speech_chunks: 15,
             rms_ema_alpha: 0.3,
             hotkey: None,
             type_mode: true,
@@ -92,6 +96,7 @@ fn parse_ini(contents: &str) -> IniValues {
                 "delay" => { if let Ok(v) = value.parse() { vals.delay = v; } }
                 "silence_threshold" => { if let Ok(v) = value.parse() { vals.silence_threshold = v; } }
                 "silence_chunks" => { if let Ok(v) = value.parse() { vals.silence_chunks = Some(v); } }
+                "paragraph_delay_offset" => { if let Ok(v) = value.parse() { vals.paragraph_delay_offset = v; } }
                 "min_speech_chunks" => { if let Ok(v) = value.parse() { vals.min_speech_chunks = v; } }
                 "rms_ema_alpha" => { if let Ok(v) = value.parse() { vals.rms_ema_alpha = v; } }
                 "hotkey" => {
@@ -119,6 +124,20 @@ pub fn load_ini(path: &Path) -> IniValues {
     }
 }
 
+/// Format settings as INI content. Single source of truth for the INI layout.
+pub fn format_ini(
+    delay: usize, silence_threshold: f32, silence_chunks: usize,
+    paragraph_delay_offset: usize, min_speech_chunks: usize,
+    rms_ema_alpha: f32, hotkey_str: &str, output_mode: &str,
+) -> String {
+    format!(
+        "delay={}\nsilence_threshold={}\nsilence_chunks={}\nparagraph_delay_offset={}\nmin_speech_chunks={}\nrms_ema_alpha={}\nhotkey={}\noutput_mode={}\n",
+        delay, silence_threshold, silence_chunks,
+        paragraph_delay_offset, min_speech_chunks,
+        rms_ema_alpha, hotkey_str, output_mode,
+    )
+}
+
 /// Save current settings to an INI file.
 pub fn save_settings(path: &Path, settings: &SharedSettings) {
     let hotkey_str = match *settings.hotkey.lock().unwrap() {
@@ -127,14 +146,14 @@ pub fn save_settings(path: &Path, settings: &SharedSettings) {
     };
     let output_mode = if settings.type_mode.load(Ordering::Relaxed) { "type" } else { "none" };
 
-    let content = format!(
-        "delay={}\nsilence_threshold={}\nsilence_chunks={}\nmin_speech_chunks={}\nrms_ema_alpha={}\nhotkey={}\noutput_mode={}\n",
+    let content = format_ini(
         settings.delay_tokens.load(Ordering::Relaxed),
         settings.silence_threshold.load(Ordering::Relaxed),
         settings.silence_chunks.load(Ordering::Relaxed),
+        settings.paragraph_delay_offset.load(Ordering::Relaxed),
         settings.min_speech_chunks.load(Ordering::Relaxed),
         settings.rms_ema_alpha.load(Ordering::Relaxed),
-        hotkey_str,
+        &hotkey_str,
         output_mode,
     );
 
@@ -163,6 +182,7 @@ pub fn reload_from_file(settings: &SharedSettings, path: &Path, hotkey_thread_id
     if let Some(sc) = vals.silence_chunks {
         settings.silence_chunks.store(sc, Ordering::Relaxed);
     }
+    settings.paragraph_delay_offset.store(vals.paragraph_delay_offset, Ordering::Relaxed);
     settings.min_speech_chunks.store(vals.min_speech_chunks, Ordering::Relaxed);
     settings.rms_ema_alpha.store(vals.rms_ema_alpha, Ordering::Relaxed);
     settings.type_mode.store(vals.type_mode, Ordering::Relaxed);

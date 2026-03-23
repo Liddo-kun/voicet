@@ -31,24 +31,118 @@ use crate::tokenizer::{self, Tokenizer};
 const SAMPLES_PER_TOKEN: usize = common::MEL_FRAMES_PER_TOKEN * mel::HOP_LENGTH;
 
 
-/// Debug status line at top of terminal (row 1). Uses ANSI save/restore cursor.
-fn debug_status(rms: f32, smooth: f32, settings: &SharedSettings, silence_ctr: usize, speech_ctr: usize, emitted: bool) {
-    let w = 30;
-    let max = 0.03f32;
-    let level = ((smooth / max).min(1.0) * w as f32) as usize;
-    let threshold = settings.silence_threshold.load(Ordering::Relaxed);
-    let tp = ((threshold / max).min(1.0) * w as f32) as usize;
-    let mut bar = String::with_capacity(w);
-    for i in 0..w {
-        if i == tp { bar.push('|'); }
-        else if i < level { bar.push('\u{2588}'); }
-        else { bar.push('\u{2591}'); }
+/// Two-stage silence detection and paragraph break state machine.
+///
+/// Stage 1 — Silence detection: counts consecutive silent chunks. Once the count
+///   reaches `silence_chunks`, silence is "detected". Only arms after speech has
+///   occurred (`silence_emitted == false`).
+///
+/// Stage 2 — Paragraph delay: once silence is detected, a separate counter ticks
+///   every chunk (even if speech resumes). When it reaches `delay_tokens + offset`,
+///   the paragraph break fires. Both stages then reset.
+struct SilenceDetector {
+    silence_counter: usize,
+    speech_counter: usize,
+    smoothed_rms: f32,
+    silence_emitted: bool,
+    silence_detected: bool,
+    paragraph_delay_counter: usize,
+}
+
+impl SilenceDetector {
+    fn new() -> Self {
+        Self {
+            silence_counter: 0,
+            speech_counter: 0,
+            smoothed_rms: 0.0,
+            silence_emitted: true,
+            silence_detected: false,
+            paragraph_delay_counter: 0,
+        }
     }
-    eprint!(
-        "\x1b[s\x1b[1;1H\x1b[K [{}] raw={:.4} ema={:.4} sil={}/{} spk={}/{} em={}\x1b[u",
-        bar, rms, smooth, silence_ctr, settings.silence_chunks.load(Ordering::Relaxed),
-        speech_ctr, settings.min_speech_chunks.load(Ordering::Relaxed), emitted,
-    );
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Process one 80ms chunk of audio. Returns true if a paragraph break should fire.
+    fn process_chunk(&mut self, rms: f32, settings: &SharedSettings) -> bool {
+        let sil_thresh = settings.silence_threshold.load(Ordering::Relaxed);
+        let rms_alpha = settings.rms_ema_alpha.load(Ordering::Relaxed);
+        self.smoothed_rms = rms_alpha * rms + (1.0 - rms_alpha) * self.smoothed_rms;
+
+        if settings.silence_chunks.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+
+        // Silence counting
+        if rms < sil_thresh {
+            self.silence_counter += 1;
+            // Stage 1: detect silence (only after speech has occurred)
+            if !self.silence_detected && !self.silence_emitted
+                && self.silence_counter >= settings.silence_chunks.load(Ordering::Relaxed)
+            {
+                self.silence_detected = true;
+                self.paragraph_delay_counter = 0;
+            }
+        } else {
+            self.silence_counter = 0;
+        }
+
+        // Stage 2: paragraph delay ticks unconditionally once triggered
+        if self.silence_detected {
+            self.paragraph_delay_counter += 1;
+        }
+
+        // Speech tracking — arms silence detection after enough speech
+        if self.smoothed_rms >= sil_thresh {
+            self.speech_counter += 1;
+            if self.speech_counter >= settings.min_speech_chunks.load(Ordering::Relaxed) {
+                self.silence_emitted = false;
+            }
+        } else {
+            self.speech_counter = 0;
+        }
+
+        // Check if paragraph break should fire
+        if self.silence_detected && !self.silence_emitted {
+            if self.paragraph_delay_counter >= Self::para_delay(settings) {
+                self.silence_emitted = true;
+                self.silence_detected = false;
+                self.paragraph_delay_counter = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn para_delay(settings: &SharedSettings) -> usize {
+        settings.delay_tokens.load(Ordering::Relaxed)
+            + settings.paragraph_delay_offset.load(Ordering::Relaxed)
+    }
+
+    fn debug_status(&self, rms: f32, settings: &SharedSettings) {
+        let w = 30;
+        let max = 0.03f32;
+        let level = ((self.smoothed_rms / max).min(1.0) * w as f32) as usize;
+        let threshold = settings.silence_threshold.load(Ordering::Relaxed);
+        let tp = ((threshold / max).min(1.0) * w as f32) as usize;
+        let mut bar = String::with_capacity(w);
+        for i in 0..w {
+            if i == tp { bar.push('|'); }
+            else if i < level { bar.push('\u{2588}'); }
+            else { bar.push('\u{2591}'); }
+        }
+        let sil_chunks = settings.silence_chunks.load(Ordering::Relaxed);
+        let para_delay = Self::para_delay(settings);
+        eprint!(
+            "\x1b[s\x1b[1;1H\x1b[K [{}] raw={:.4} ema={:.4} sil={}/{} det={} pd={}/{} spk={}/{} em={}\x1b[u",
+            bar, rms, self.smoothed_rms,
+            self.silence_counter, sil_chunks, self.silence_detected,
+            self.paragraph_delay_counter, para_delay,
+            self.speech_counter, settings.min_speech_chunks.load(Ordering::Relaxed), self.silence_emitted,
+        );
+    }
 }
 
 // Incremental conv stem: keep 4 mel frames as context between iterations.
@@ -289,11 +383,7 @@ pub fn run_streaming(
     let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
     let mut local_delay = delay;
 
-    // Silence detection state
-    let mut silence_counter: usize = 0;
-    let mut speech_counter: usize = 0;
-    let mut smoothed_rms: f32 = 0.0;
-    let mut silence_emitted = true;
+    let mut sil = SilenceDetector::new();
     let mut sample_buf_for_silence: Vec<f32> = Vec::new();
 
     let mut prev_state_val = settings.state.load(Ordering::SeqCst);
@@ -365,11 +455,7 @@ pub fn run_streaming(
                 if mel_buffer.len() > CONV_CTX {
                     mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
                 }
-                // Reset silence detection
-                silence_counter = 0;
-                speech_counter = 0;
-                smoothed_rms = 0.0;
-                silence_emitted = true;
+                sil.reset();
                 sample_buf_for_silence.clear();
             }
 
@@ -398,38 +484,20 @@ pub fn run_streaming(
 
             mel_buffer.extend(inc_mel.drain_frames());
 
-            // Silence detection
+            // Silence detection + paragraph break
             while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
                 let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
                     .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
                 sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
-                let rms_alpha = settings.rms_ema_alpha.load(Ordering::Relaxed);
-                let sil_thresh = settings.silence_threshold.load(Ordering::Relaxed);
-                smoothed_rms = rms_alpha * rms + (1.0 - rms_alpha) * smoothed_rms;
-                if rms < sil_thresh {
-                    silence_counter += 1;
-                } else {
-                    silence_counter = 0;
+                if sil.process_chunk(rms, settings) {
+                    sink.emit_newline();
                 }
-                if smoothed_rms >= sil_thresh {
-                    speech_counter += 1;
-                    if speech_counter >= settings.min_speech_chunks.load(Ordering::Relaxed) {
-                        silence_emitted = false;
-                    }
-                } else {
-                    speech_counter = 0;
-                }
-                debug_status(rms, smoothed_rms, settings, silence_counter, speech_counter, silence_emitted);
+                sil.debug_status(rms, settings);
             }
 
             let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
                 &mut mel_buffer, device, dtype, &mut sink)?;
             if eos { break; }
-
-            if silence_counter >= settings.silence_chunks.load(Ordering::Relaxed) && !silence_emitted {
-                sink.emit_newline();
-                silence_emitted = true;
-            }
         }
 
         prev_state_val = current_state_val;

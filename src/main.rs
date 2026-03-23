@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long)]
     silence_threshold: Option<f32>,
 
-    /// Silence chunks before paragraph break (default: delay + 14)
+    /// Silence chunks before silence is detected (default: 20 = 1600ms)
     #[arg(long)]
     silence_flush: Option<usize>,
 
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         eprintln!("         Consider adding --hotkey F9 to toggle recording.");
     }
 
-    let silence_chunks = vals.silence_chunks.unwrap_or(vals.delay + 14);
+    let silence_chunks = vals.silence_chunks.unwrap_or(settings::SILENCE_CHUNKS_DEFAULT);
 
     // mmap the safetensors file (instant — no disk I/O yet) and spawn readahead
     // thread to pre-fault pages at full sequential bandwidth. Starting this before
@@ -140,7 +140,9 @@ fn main() -> Result<()> {
     println!("{:<28} {} (RMS < {})",
         "Silence threshold", vals.silence_threshold, vals.silence_threshold);
     println!("{:<28} {} ({}ms)",
-        "Silence newline after", silence_chunks, silence_chunks * 80);
+        "Silence detection", silence_chunks, silence_chunks * 80);
+    println!("{:<28} {} ({}ms)",
+        "Paragraph delay offset", vals.paragraph_delay_offset, vals.paragraph_delay_offset * 80);
     println!("{:<28} {} ({}ms)",
         "Min speech to activate", vals.min_speech_chunks, vals.min_speech_chunks * 80);
     println!("{:<28} {}", "RMS EMA alpha", vals.rms_ema_alpha);

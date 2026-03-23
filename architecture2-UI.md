@@ -41,8 +41,9 @@ The settings window runs as a separate process (`voicet.exe --settings-ui`), not
 ┌─ voicet settings ─────────────────┐
 │  Delay              [▼ 4 ▲]      │
 │  Silence threshold  [▼ 0.006 ▲]  │
-│  Paragraph break    [▼ 18 ▲]     │
-│  Min speech         [▼ 12 ▲]     │
+│  Silence detection  [▼ 20 ▲]     │
+│  Paragraph delay    [▼ 4 ▲]      │
+│  Min speech         [▼ 15 ▲]     │
 │  EMA smoothing      [▼ 0.30 ▲]   │
 │  Hotkey             [ F9      ▼ ] │
 │  Output mode     [Type ○ / ○ None]│
@@ -51,7 +52,20 @@ The settings window runs as a separate process (`voicet.exe --settings-ui`), not
 └───────────────────────────────────┘
 ```
 
-No title bar, always on top, positioned lower-right above taskbar.
+No title bar, always on top. Window is 251×255 pixels, not resizable. Positioned lower-right: on Windows, `(screen_w - 259, screen_h - 311)` (8px margin, 48px taskbar offset). Linux fallback: (800, 400).
+
+Settings are **not live** — the subprocess holds local copies of all values, not shared atomics. Changes only take effect when the window closes and the parent calls `reload_from_file()`. If the settings window is already open, right-click on the tray icon does nothing.
+
+### Settings ranges and defaults
+
+| Setting | Default | Range | Step |
+|---------|---------|-------|------|
+| Delay | 4 | 1–30 | 1 |
+| Silence threshold | 0.006 | 0.001–0.1 | 0.001 |
+| Silence detection | 20 | 1–100 | 1 |
+| Paragraph delay | 4 | 0–100 | 1 |
+| Min speech | 15 | 1–100 | 1 |
+| EMA smoothing | 0.30 | 0.01–1.0 | 0.01 |
 
 ## State Machine
 

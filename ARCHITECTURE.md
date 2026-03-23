@@ -99,6 +99,26 @@ Each 80ms tick:
 
 The conv stem runs on a fixed 12-frame window each tick (O(1) per token, not O(n) over the full session). Only 4 mel frames of context are retained between iterations.
 
+### Silence detection and paragraph breaks
+
+A two-stage state machine (`SilenceDetector` in `streaming.rs`) inserts paragraph breaks during natural pauses in speech.
+
+**Stage 1 — Silence detection:** Each 80ms chunk, raw RMS energy is compared against `silence_threshold`. Consecutive silent chunks are counted. When the count reaches `silence_chunks` (default 20 = 1600ms), silence is "detected". This stage only arms after enough speech has occurred (`min_speech_chunks` consecutive non-silent chunks, using EMA-smoothed RMS), preventing false triggers at startup or after a pause/resume.
+
+**Stage 2 — Paragraph delay:** Once silence is detected, a separate counter ticks every chunk unconditionally — even if speech briefly resumes. When it reaches `delay_tokens + paragraph_delay_offset`, the paragraph break fires (two Shift+Enter keystrokes in type mode, or `\n\n` in stdout mode). Both stages then reset, requiring new speech before the next break can arm.
+
+```
+speech → silence_counter climbing → hits silence_chunks → DETECTED
+           │                                                  │
+           │ (speech resumes? counter resets,                  ▼
+           │  but stage 2 keeps ticking)          paragraph_delay_counter
+           │                                                  │
+           │                                    hits delay_tokens + offset
+           │                                                  │
+           ▼                                                  ▼
+     [waiting for silence]                         [PARAGRAPH BREAK]
+```
+
 ---
 
 ## Configurable Parameters
@@ -109,8 +129,9 @@ All parameters are adjustable via the settings window (right-click tray icon) an
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `--delay`             | 4 (320ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. Valid: 1-30.                             |
 | `--silence-threshold` | 0.006     | Raw RMS energy below which a chunk counts as silent.                                                                                  |
-| `--silence-flush`     | delay+14  | Consecutive silent chunks before emitting a paragraph break.                                                                          |
-| `--min-speech`        | 12 (960ms)| Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
+| `--silence-flush`     | 20 (1600ms)| Consecutive silent chunks before silence is detected (stage 1). Independent of delay.                                                |
+| `paragraph_delay_offset` | 4 (320ms) | Extra chunks added to `delay_tokens` for the paragraph delay timer (stage 2). Paragraph break fires `delay_tokens + offset` chunks after silence detection. Setting only — no CLI flag. |
+| `--min-speech`        | 15 (1200ms)| Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
 | `--rms-ema`           | 0.3       | EMA smoothing factor for speech detection. Lower = smoother, rides over inter-syllable dips.                                          |
 | `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen).                                                           |
 | `--type`              | on        | Inject text as keystrokes into focused app via enigo instead of printing to stdout.                                                   |
@@ -126,7 +147,7 @@ All parameters are adjustable via the settings window (right-click tray icon) an
 
 ## Dependencies
 
-Voicet uses the [candle](https://github.com/huggingface/candle) ML framework for Rust. Three crates are used: `candle-core`, `candle-nn`, and `candle-flash-attn`. All are vendored locally in `candle-fork/` (referenced via `path` in `Cargo.toml`) so builds work offline.
+Voicet uses the [candle](https://github.com/huggingface/candle) ML framework for Rust. Three crates are used: `candle-core`, `candle-nn`, and `candle-flash-attn`. All are vendored locally in `candle-fork/` (referenced via `path` in `Cargo.toml`) so builds work offline. The `cudarc` dependency has `curand` and `cublaslt` features removed — voicet uses neither random number generation nor cuBLAS LT APIs directly (cuBLAS LT is still loaded transitively by cuBLAS at runtime).
 
 The `candle-flash-attn` crate is a fork ([Liddo-kun/candle](https://github.com/Liddo-kun/candle), branch `voicet-minimal-kernels`) that compiles only the CUDA kernels this model needs: BF16, head_dim 64 (encoder) and 128 (decoder). The upstream crate compiles all 32 variants (8 head dims × 2 dtypes × 2 causal modes), which inflated the binary from ~10 MB to ~190 MB. The fork reduces it to ~35 MB.
 
