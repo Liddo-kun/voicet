@@ -16,6 +16,8 @@ Automatic paragraph breaks on speech pauses (configurable)
 
 ## Features
 
+Lightweight tray icon and UI (right click to pause transcription, right click to open settings)  [ all settings are available in the UI, saved to settings.ini]
+
 Fastest implementation of Voxtral Mini 4B Realtime in CUDA on the web. 5x realtime on RTX 5080.
 
 Type mode [--type] supports dictation directly into your text editor  (Word, Claude Code). Just speak and words appear.
@@ -33,12 +35,12 @@ The official HuggingFace pipeline works, but it carries a lot of weight:
 |                                       | **Voicet (Rust)**                                             | **HF Transformers (Python)**                      |
 | ------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------- |
 | Runtime                               | Single 35 MB binary                                           | Python + PyTorch + Transformers (~5 GB installed) |
-| Cold Startup                          | 2.94s (mmap weights directly)                                 | 14.4s (Python imports +weight loading)            |
+| Cold Startup                          | 2.5s (mmap weights directly)                                  | 14.4s (Python imports +weight loading)            |
 | Throughput (RTX 5080)                 | **63 tok/s** (5x real-time)                                   | 24.5 tok/s (2.1x real-time)                       |
 | Realtime Power Consumption (RTX 5080) | 51W                                                           | 110W                                              |
 | Streaming                             | Native — causal architecture, incremental mel/encoder/decoder | Requires custom pipeline code                     |
 | Dependencies                          | Just CUDA runtime                                             | Python ecosystem, pip, conda, venv                |
-| Deployment                            | Copy one binary + model weights                               | Reproduce Python environment                      |
+| Deployment                            | one binary + Mistral model                                    | Reproduce Python environment                      |
 
 Performance comes from:
 
@@ -56,7 +58,7 @@ Other features: Resumable requests. Processes audio pipeline in parallel with gp
 
 - NVIDIA GPU with CUDA support (tested on RTX 5080)
 - [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) installed (Linux only - included for Windows release)
-- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into the voicet.exe directory. You only need consolidated.safetensors and tekken.json
+- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602/tree/main) into the voicet.exe directory. You only need **consolidated.safetensors** and **tekken.json**
 
 ### Build
 
@@ -106,17 +108,17 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full details.
 
 ## Configuration
 
-| CLI flag              | Default   | Effect                                                                        |
-| --------------------- | --------- | ----------------------------------------------------------------------------- |
-| `--delay`             | 4 (320ms) | Accuracy vs latency. Higher = more lookahead. Auto-set to 20 in offline mode. |
-| `--silence-threshold` | 0.006     | RMS energy below which audio counts as silence.                               |
-| `--silence-flush`     | delay+14  | Consecutive silent chunks before paragraph break.                             |
-| `--min-speech`        | 12 (960ms)| Minimum speech duration before silence detection activates.                   |
-| `--rms-ema`           | 0.3       | EMA smoothing factor for speech detection.                                    |
-| `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause).                |
-| `--type`              | off       | Type transcribed words directly into the focused app.                         |
-| `--model-dir`         | `.`       | Directory containing model files.                                             |
-| `--device`            | 0         | CUDA device index.                                                            |
+| CLI flag              | Default    | Effect                                                                        |
+| --------------------- | ---------- | ----------------------------------------------------------------------------- |
+| `--delay`             | 4 (320ms)  | Accuracy vs latency. Higher = more lookahead. Auto-set to 20 in offline mode. |
+| `--silence-threshold` | 0.006      | RMS energy below which audio counts as silence.                               |
+| `--silence-flush`     | delay+14   | Consecutive silent chunks before paragraph break.                             |
+| `--min-speech`        | 12 (960ms) | Minimum speech duration before silence detection activates.                   |
+| `--rms-ema`           | 0.3        | EMA smoothing factor for speech detection.                                    |
+| `--hotkey`            | none       | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause).                |
+| `--type`              | off        | Type transcribed words directly into the focused app.                         |
+| `--model-dir`         | `.`        | Directory containing model files.                                             |
+| `--device`            | 0          | CUDA device index.                                                            |
 
 ## Dependencies
 
